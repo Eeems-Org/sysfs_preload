@@ -1,114 +1,91 @@
-#include <QMutex>
-#include <QString>
-#include <QVariant>
-
-#include <thread>
+#include <atomic>
 #include <chrono>
-#include <filesystem>
-#include <dlfcn.h>
-#include <unistd.h>
 #include <dirent.h>
+#include <dlfcn.h>
+#include <filesystem>
 #include <linux/fcntl.h>
+#include <mutex>
 #include <sys/socket.h>
 #include <systemd/sd-journal.h>
+#include <thread>
+#include <unistd.h>
+#include <sys/prctl.h>
+
+#define forever for(;;)
 
 static int(*func_open)(const char*, int, mode_t) = nullptr;
-static QMutex logMutex;
+static std::mutex logMutex;
 static std::thread stateThread;
-std::atomic<bool> stateThreadRunning = false;
+static std::atomic<bool> stateThreadRunning = false;
+static bool exitThread = false;
 static int stateFds[2] = {-1, -1};
-static QMutex stateMutex;
+static std::mutex stateMutex;
 
-// Use this instead of Oxide::getAppName to avoid recursion when logging in open()
-QString appName(){
-    static QString name;
-    if(!name.isEmpty()){
-        return name;
-    }
-    if(func_open == nullptr){
-        return "liboxide_sysfs_preload.so";
-    }
-    int fd = func_open("/proc/self/comm", O_RDONLY, 0);
-    if(fd != -1){
-        FILE* f = fdopen(fd, "r");
-        fseek(f, 0, SEEK_END);
-        size_t size = ftell(f);
-        char* where = new char[size];
-        rewind(f);
-        fread(where, sizeof(char), size, f);
-        name = QString::fromLatin1(where, size);
-        delete[] where;
-    }
-    if(!name.isEmpty()){
-        return name;
-    }
-    name = QString::fromStdString(std::filesystem::canonical("/proc/self/exe").string());
-    if(name.isEmpty()){
-        return "liboxide_sysfs_preload.so";
-    }
-    return name;
-}
-
-template<class... Args>
-void __printf(char const* file, unsigned int line, char const* func, int priority, Args... args){
-    if(!qEnvironmentVariableIsSet("OXIDE_PRELOAD_DEBUG")){
-        return;
-    }
-    QStringList list;
-    ([&]{ list << QVariant(args).toString(); }(), ...);
-    auto msg = list.join(' ');
-    sd_journal_send(
-        "MESSAGE=%s", msg.toStdString().c_str(),
-        "PRIORITY=%i", priority,
-        "CODE_FILE=%s", file,
-        "CODE_LINE=%i", line,
-        "CODE_FUNC=%s", func,
-        "SYSLOG_IDENTIFIER=%s", appName().toStdString().c_str(),
-        "SYSLOG_FACILITY=%s", "LOG_DAEMON",
-        NULL
-    );
-    if(!isatty(fileno(stdin)) || !isatty(fileno(stdout)) || !isatty(fileno(stderr))){
-        return;
-    }
-    QMutexLocker locker(&logMutex);
-    Q_UNUSED(locker)
+inline void __printf_header(int priority){
     std::string level;
     switch(priority){
         case LOG_INFO:
             level = "Info";
-        break;
+            break;
         case LOG_WARNING:
             level = "Warning";
-        break;
+            break;
         case LOG_CRIT:
             level = "Critical";
-        break;
+            break;
         default:
             level = "Debug";
     }
+    char name[16];
+    prctl(PR_GET_NAME, name);
+    auto selfpath = realpath("/proc/self/exe", NULL);
     fprintf(
         stderr,
-        "[%i:%i:%i %s] %s: %s (%s:%u, %s)\n",
+        "[%i:%i:%i %s - %s] %s: ",
         getpgrp(),
         getpid(),
         gettid(),
-        appName().toStdString().c_str(),
-        level.c_str(),
-        msg.toStdString().c_str(),
+        selfpath,
+        name,
+        level.c_str()
+    );
+    free(selfpath);
+}
+
+inline void __printf_footer(const char* file, unsigned int line, const char* func){
+    fprintf(
+        stderr,
+        " (%s:%u, %s)\n",
         file,
         line,
         func
     );
 }
-#define _PRINTF(priority, ...) __printf("shared/preload-sysfs/main.cpp", __LINE__, __PRETTY_FUNCTION__, priority, __VA_ARGS__)
+#define _PRINTF(priority, ...) \
+    if(std::getenv("OXIDE_PRELOAD_DEBUG") != nullptr){ \
+        logMutex.lock(); \
+        __printf_header(priority); \
+        fprintf(stderr, __VA_ARGS__); \
+        __printf_footer(__FILE__, __LINE__, __PRETTY_FUNCTION__); \
+        logMutex.unlock(); \
+    }
 #define _DEBUG(...) _PRINTF(LOG_DEBUG, __VA_ARGS__)
 #define _WARN(...) _PRINTF(LOG_WARNING, __VA_ARGS__)
 #define _INFO(...) _PRINTF(LOG_INFO, __VA_ARGS__)
 #define _CRIT(...) _PRINTF(LOG_CRIT, __VA_ARGS__)
 
+inline std::string trim(std::string& str){
+    str.erase(str.find_last_not_of(' ') + 1);
+    str.erase(0, str.find_first_not_of(' '));
+    return str;
+}
+
 void __thread_run(int fd){
     char line[PIPE_BUF];
     forever{
+        if(exitThread){
+            break;
+        }
         int res = read(fd, line, PIPE_BUF);
         if(res == -1){
             if(errno == EINTR){
@@ -118,19 +95,20 @@ void __thread_run(int fd){
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 continue;
             }
-            _WARN("/sys/power/state pipe failed to read:", strerror(errno));
-            _DEBUG("/sys/power/state pip fd:", fd);
+            _WARN("/sys/power/state pipe failed to read: %s", strerror(errno));
+            _DEBUG("/sys/power/state pip fd: %d", fd);
             break;
         }
         if(res == 0){
             continue;
         }
-        auto data = QString::fromStdString(std::string(line, res)).trimmed();
-        if((QStringList() << "mem" << "freeze" << "standby").contains(data)){
-            _INFO("Suspending system due to", data, "request");
+        auto data = std::string(line, res);
+        trim(data);
+        if(data == "mem" || data == "freeze" || data == "standby"){
+            _INFO("Suspending system due to %s request", data.c_str());
             system("systemctl suspend");
         }else{
-            _WARN("Unknown power state call:", data);
+            _WARN("Unknown power state call: %s", data.c_str());
         }
     }
     stateThreadRunning = false;
@@ -138,6 +116,10 @@ void __thread_run(int fd){
 
 int __open(const char* pathname, int flags){
     if(strcmp(pathname, "/sys/power/state") != 0){
+        return -2;
+    }
+    // TODO - handle O_RDWR somehow
+    if(flags == O_RDONLY){
         return -2;
     }
     stateMutex.lock();
@@ -161,7 +143,7 @@ int __open(const char* pathname, int flags){
         stateThread = std::thread(__thread_run, stateFds[1]);
         _INFO("/sys/power/state pipe opened");
     }else{
-        _WARN("Unable to open /sys/power/state pipe:", strerror(errno));
+        _WARN("Unable to open /sys/power/state pipe: %s", strerror(errno));
     }
     stateMutex.unlock();
     return stateFds[0];
@@ -189,7 +171,10 @@ extern "C" {
             getcwd(path, PATH_MAX);
             fchdir(::dirfd(save));
             closedir(save);
-            fd = __open(QString("%1/%2").arg(path, pathname).toStdString().c_str(), flags);
+            std::string filepath(path);
+            filepath += "/";
+            filepath += pathname;
+            fd = __open(filepath.c_str(), flags);
         }
         if(fd == -2){
             fd = func_openat(dirfd, pathname, flags, mode);
@@ -208,6 +193,35 @@ extern "C" {
 
     void __attribute__ ((constructor)) init(void);
     void init(void){
+        _INFO("Starting sysfs preload")
         func_open = (int(*)(const char*, int, mode_t))dlsym(RTLD_NEXT, "open");
+    }
+
+    __attribute__((visibility("default")))
+    int __libc_start_main(
+        int(*_main)(int, char**, char**),
+        int argc,
+        char** argv,
+        int(*init)(int, char**, char**),
+        void(*fini)(void),
+        void(*rtld_fini)(void),
+        void* stack_end
+    ){
+        auto func_main = (decltype(&__libc_start_main))dlsym(RTLD_NEXT, "__libc_start_main");
+        int res = func_main(
+            _main,
+            argc,
+            argv,
+            init,
+            fini,
+            rtld_fini,
+            stack_end
+        );
+        if(stateThreadRunning){
+            _DEBUG("Waiting for thread to exit");
+            exitThread = true;
+            stateThread.join();
+        }
+        return res;
     }
 }
