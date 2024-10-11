@@ -76,7 +76,6 @@ namespace {
     #define _WARN(...) _PRINTF(LOG_WARNING, __VA_ARGS__)
     #define _INFO(...) _PRINTF(LOG_INFO, __VA_ARGS__)
     #define _CRIT(...) _PRINTF(LOG_CRIT, __VA_ARGS__)
-    #define _UNUSED(x)
 
     inline std::string trim(std::string& str){
         str.erase(str.find_last_not_of(' ') + 1);
@@ -116,8 +115,7 @@ namespace {
             }
         }
         {
-            std::lock_guard<std::mutex> lock(stateThreadConditionMutex);
-            _UNUSED(lock);
+            [[maybe_unused]] std::lock_guard<std::mutex> lock(stateThreadConditionMutex);
             stateThreadRunning = false;
         }
         stateThreadCondition.notify_one();
