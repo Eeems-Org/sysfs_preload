@@ -2,7 +2,6 @@
 #include <chrono>
 #include <dirent.h>
 #include <dlfcn.h>
-#include <filesystem>
 #include <linux/fcntl.h>
 #include <mutex>
 #include <sys/socket.h>
@@ -10,12 +9,15 @@
 #include <thread>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <condition_variable>
 
 #define forever for(;;)
 
 namespace {
     static int(*func_open)(const char*, int, mode_t) = nullptr;
     static std::mutex logMutex;
+    std::condition_variable stateThreadCondition;
+    std::mutex stateThreadConditionMutex;
     static std::thread stateThread;
     static std::atomic<bool> stateThreadRunning = false;
     static bool exitThread = false;
@@ -112,7 +114,11 @@ namespace {
                 _WARN("Unknown power state call: %s", data.c_str());
             }
         }
-        stateThreadRunning = false;
+        {
+            [[maybe_unused]] std::lock_guard<std::mutex> lock(stateThreadConditionMutex);
+            stateThreadRunning = false;
+            stateThreadCondition.notify_one();
+        }
     }
 
     int __open(const char* pathname, int flags){
@@ -218,10 +224,15 @@ extern "C" {
             rtld_fini,
             stack_end
         );
-        if(stateThreadRunning){
-            _DEBUG("Waiting for thread to exit");
-            exitThread = true;
-            stateThread.join();
+        exitThread = true;
+        _DEBUG("Waiting for thread to exit");
+        {
+            std::unique_lock<std::mutex> lock(stateThreadConditionMutex);
+            if(!stateThreadCondition.wait_for(lock, std::chrono::seconds(5), []{
+                return !stateThreadRunning;
+            })){
+                _WARN("Timeout waiting for state thread to exit");
+            }
         }
         return res;
     }
