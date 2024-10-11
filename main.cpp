@@ -219,14 +219,12 @@ extern "C" {
             stack_end
         );
         exitThread = true;
-        if(stateThreadRunning){
-            _DEBUG("Waiting for thread to exit");
+        _DEBUG("Waiting for thread to exit");
+        while(stateThreadRunning){
             if(stateThread.joinable()){
                 stateThread.join();
             }else{
-                while(stateThreadRunning){
-                    usleep(1000);
-                }
+                usleep(1000);
             }
         }
         return res;
