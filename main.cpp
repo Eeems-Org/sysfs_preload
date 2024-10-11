@@ -117,8 +117,8 @@ namespace {
         {
             [[maybe_unused]] std::lock_guard<std::mutex> lock(stateThreadConditionMutex);
             stateThreadRunning = false;
+            stateThreadCondition.notify_one();
         }
-        stateThreadCondition.notify_one();
     }
 
     int __open(const char* pathname, int flags){
