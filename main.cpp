@@ -218,10 +218,16 @@ extern "C" {
             rtld_fini,
             stack_end
         );
+        exitThread = true;
         if(stateThreadRunning){
             _DEBUG("Waiting for thread to exit");
-            exitThread = true;
-            stateThread.join();
+            if(stateThread.joinable()){
+                stateThread.join();
+            }else{
+                while(stateThreadRunning){
+                    usleep(1000);
+                }
+            }
         }
         return res;
     }
