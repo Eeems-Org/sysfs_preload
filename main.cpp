@@ -10,12 +10,15 @@
 #include <thread>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <condition_variable>
 
 #define forever for(;;)
 
 namespace {
     static int(*func_open)(const char*, int, mode_t) = nullptr;
     static std::mutex logMutex;
+    std::condition_variable stateThreadCondition;
+    std::mutex stateThreadConditionMutex;
     static std::thread stateThread;
     static std::atomic<bool> stateThreadRunning = false;
     static bool exitThread = false;
@@ -74,6 +77,7 @@ namespace {
     #define _WARN(...) _PRINTF(LOG_WARNING, __VA_ARGS__)
     #define _INFO(...) _PRINTF(LOG_INFO, __VA_ARGS__)
     #define _CRIT(...) _PRINTF(LOG_CRIT, __VA_ARGS__)
+    #define _UNUSED(x)
 
     inline std::string trim(std::string& str){
         str.erase(str.find_last_not_of(' ') + 1);
@@ -112,7 +116,12 @@ namespace {
                 _WARN("Unknown power state call: %s", data.c_str());
             }
         }
-        stateThreadRunning = false;
+        {
+            std::lock_guard<std::mutex> lock(stateThreadConditionMutex);
+            _UNUSED(lock);
+            stateThreadRunning = false;
+        }
+        stateThreadCondition.notify_one();
     }
 
     int __open(const char* pathname, int flags){
@@ -220,11 +229,12 @@ extern "C" {
         );
         exitThread = true;
         _DEBUG("Waiting for thread to exit");
-        while(stateThreadRunning){
-            if(stateThread.joinable()){
-                stateThread.join();
-            }else{
-                usleep(1000);
+        {
+            std::unique_lock<std::mutex> lock(stateThreadConditionMutex);
+            if(!stateThreadCondition.wait_for(lock, std::chrono::seconds(5), []{
+                return !stateThreadRunning;
+            })){
+                _WARN("Timeout waiting for state thread to exit");
             }
         }
         return res;
