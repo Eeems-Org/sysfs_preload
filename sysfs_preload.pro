@@ -2,7 +2,7 @@ TARGET = sysfs_preload
 TEMPLATE = lib
 
 QMAKE_RPATHDIR += /lib /usr/lib /opt/lib /opt/usr/lib
-VERSION = 1.0.2
+VERSION = 1.0.3
 
 CONFIG += hide_symbols
 CONFIG += c++17
